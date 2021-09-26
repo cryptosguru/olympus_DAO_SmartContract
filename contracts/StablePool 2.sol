@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-pragma solidity 0.7.6;
+pragma solidity 0.7.5;
 
 library SafeMath {
 
@@ -185,26 +185,6 @@ library Address {
     }
 }
 
-interface IERC20 {
-    function decimals() external view returns (uint8);
-
-    function totalSupply() external view returns (uint256);
-
-    function balanceOf(address account) external view returns (uint256);
-
-    function transfer(address recipient, uint256 amount) external returns (bool);
-
-    function allowance(address owner, address spender) external view returns (uint256);
-
-    function approve(address spender, uint256 amount) external returns (bool);
-
-    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
-
-    event Transfer(address indexed from, address indexed to, uint256 value);
-
-    event Approval(address indexed owner, address indexed spender, uint256 value);
-}
-
 library SafeERC20 {
     using SafeMath for uint256;
     using Address for address;
@@ -245,189 +225,143 @@ library SafeERC20 {
     }
 }
 
-library FullMath {
-    function fullMul(uint256 x, uint256 y) private pure returns (uint256 l, uint256 h) {
-        uint256 mm = mulmod(x, y, uint256(-1));
-        l = x * y;
-        h = mm - l;
-        if (mm < l) h -= 1;
-    }
+interface IERC20 {
+    function decimals() external view returns (uint8);
 
-    function fullDiv(
-        uint256 l,
-        uint256 h,
-        uint256 d
-    ) private pure returns (uint256) {
-        uint256 pow2 = d & -d;
-        d /= pow2;
-        l /= pow2;
-        l += h * ((-pow2) / pow2 + 1);
-        uint256 r = 1;
-        r *= 2 - d * r;
-        r *= 2 - d * r;
-        r *= 2 - d * r;
-        r *= 2 - d * r;
-        r *= 2 - d * r;
-        r *= 2 - d * r;
-        r *= 2 - d * r;
-        r *= 2 - d * r;
-        return l * r;
-    }
+    function totalSupply() external view returns (uint256);
 
-    function mulDiv(
-        uint256 x,
-        uint256 y,
-        uint256 d
-    ) internal pure returns (uint256) {
-        (uint256 l, uint256 h) = fullMul(x, y);
-        uint256 mm = mulmod(x, y, d);
-        if (mm > l) h -= 1;
-        l -= mm;
-        require(h < d, 'FullMath::mulDiv: overflow');
-        return fullDiv(l, h, d);
-    }
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address recipient, uint256 amount) external returns (bool);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    event Approval(address indexed owner, address indexed spender, uint256 value);
 }
 
-interface IStaking {
-    function stake( uint _amount, address _recipient ) external returns ( bool );
+interface ITreasury {
+    function deposit( address token, uint amount, uint profit ) external returns ( uint );
+    function valueOf( address token, uint amount ) external view returns ( uint );
 }
 
-contract BondTeller {
+interface IMintableERC20 is IERC20 {
+    function mint( address to, uint amount ) external;
+    function burn( address from, uint amount ) external;
+}
 
-    /* ========== DEPENDENCIES ========== */
+contract StablePool {
 
-    using SafeMath for uint;
+    using SafeMath for *;
     using SafeERC20 for IERC20;
-
-
-
-    /* ========== EVENTS ========== */
-
-    event BondCreated( address indexed bonder, uint payout, uint expires );
-    event Redeemed( address indexed bonder, uint payout );
-
-
-
-    /* ========== MODIFIERS ========== */
-
-    modifier onlyDepository() {
-        require( msg.sender == depository, "Only depository" );
-        _;
-    }
 
 
 
     /* ========== STRUCTS ========== */
 
-    // Info for bond holder
-    struct Bond {
-        uint payout; // sOHM remaining to be paid. agnostic balance
-        uint vested; // Block when vested
-        bool redeemed;
+    struct PoolToken {
+        uint lowAP; // 9 decimals
+        uint highAP; // 9 decimals
+        bool accepting; // can send in (swap or add)
     }
 
 
 
     /* ========== STATE VARIABLES ========== */
 
-    address depository; // contract where users deposit bonds
-    address immutable staking; // contract to stake payout
-    IERC20 immutable OHM; 
-    IERC20 immutable sOHM; // payment token
-    ITreasury immutable treasury; 
+    IMintableERC20 public shareToken; // represents 1 token in the pool
 
-    mapping( address => Bond[] ) public bonderInfo; // user data
+    address[] public poolTokens; // tokens in pool
+    mapping( address => PoolToken ) public tokenInfo; // info for tokens in pool
 
+    uint public totalStables; // total tokens in pool
+    uint totalHighAP; // sum of high weights
+    uint totalLowAP; // sum of low weights
 
-
+    uint public swapFee; // taken on every trade
+    uint public feesCollected; // share tokens not minted yet. payable to treasury.
+    
+    ITreasury immutable treasury;
+    
     /* ========== CONSTRUCTOR ========== */
-
-    constructor( address _depository, address _staking, address _OHM ) {
-        require( _depository != address(0) );
-        depository = _depository;
-        require( _staking != address(0) );
-        staking = _staking;
+    
+    constructor( address _shareToken, address _treasury ) {
+        require( _shareToken != address(0) );
+        shareToken = IMintableERC20( _shareToken );
+        
         require( _treasury != address(0) );
         treasury = ITreasury( _treasury );
-        require( _OHM != address(0) );
-        OHM = IERC20( _OHM );
-        require( _sOHM != address(0) );
-        sOHM = _sOHM;
     }
 
 
 
-    /* ========== DEPOSITORY FUNCTIONS ========== */
+    /* ========== EXCHANGE FUNCTIONS ========== */
 
     /**
-     *  @notice add new bond payout to user data
-     *  @param _bonder address
-     *  @param _payout uint
-     *  @param _end uint
-     */
-    function newBond( address _bonder, uint _payout, uint _vesting ) external onlyDepository() {
-        treasury.mintRewards( address(this), _payout );
-
-        OHM.approve( staking, _payout ); // approve staking payout
-
-        // store bond & stake payout
-        bonderInfo[ _bonder ].push( Bond({ 
-            payout: IStaking( staking ).stake( _payout, address(this), true ),
-            vested: block.number.add( _vesting ),
-            redeemed: false
-        } ) );
-
-        // indexed events are emitted
-        emit BondCreated( _bonder, _payout, newVesting );
-    }
-
-    /* ========== INTERACTABLE FUNCTIONS ========== */
-
-    /**
-     *  @notice redeems all redeemable bonds
-     *  @param _bonder address
-     *  @return uint
-     */
-    function redeemAll( address _bonder ) external returns ( uint ) {
-        return redeem( _bonder, indexesFor( _bonder ) );
-    }
-
-    /** 
-     *  @notice redeem bond for user
-     *  @param _bonder address
-     *  @param _indexes uint[]
-     *  @return uint
-     */ 
-    function redeem( address _bonder, uint[] calldata indexes ) public returns ( uint ) {
-        uint dues;
-        for( uint i = 0; i < _indexes.length; i++ ) {
-            uint index = _indexes[ i ];
-            Bond memory info = bonderInfo[ _bonder ][ index ];
-
-            if ( !info.redeemed && percentVestedFor( _bonder, index ) >= 10000 ) {
-                bonderInfo[ _bonder ][ index ].redeemed = true; // mark as redeemed
-                dues = dues.add( info.payout );
-            }
-        }
-
-        dues = IStaking( staking ).fromAgnosticAmount( dues );
-
-        emit Redeemed( _bonder, dues );
-        pay( _bonder, dues );
-        return dues;
-    }
-
-
-
-    /* ========== INTERNAL FUNCTIONS ========== */
-
-    /**
-     *  @notice send payout
+     *  @notice swap stables 1:1 while pool balance is within range
+     *  @param _firstToken address
      *  @param _amount uint
-     *  @return uint
+     *  @param _secondToken address
      */
-    function pay( address _bonder, uint _amount ) internal {
-        sOHM.transfer( _bonder, _amount );
+    function swap( address _firstToken, uint _amount, address _secondToken ) external {
+        canExecute( _firstToken, _amount, _secondToken );
+        
+        IERC20( _firstToken ).safeTransferFrom( msg.sender, address(this), _amount );
+
+        uint fee = _amount.mul( swapFee ).div( 1e4 );
+        feesCollected = feesCollected.add( fee );
+
+        IERC20( _secondToken ).safeTransfer( msg.sender, _amount.sub( fee ) );
+    }
+
+    /**
+     *  @notice add single sided liquidity to pool unless token range upper bound will be exceeded
+     *  @param _token address
+     *  @param _amount uint
+     */
+    function add( address _token, uint _amount ) external {
+        canAdd( _token, _amount ); // check if can add
+
+        IERC20( _token ).safeTransferFrom( msg.sender, address(this), _amount ); // send token added
+
+        shareToken.mint( msg.sender, _amount ); // mint pool token
+    }
+
+    /**
+     *  @notice remove single sided liquidity from pool unless token range lower bound will be exceeded
+     *  @param _token address
+     *  @param _amount uint
+     */
+    function remove( address _token, uint _amount ) external {
+        canRemove( _token, _amount ); // check if can remove
+
+        shareToken.burn( msg.sender, _amount ); // burn pool token
+
+        IERC20( _token ).safeTransfer( msg.sender, _amount ); // send token removed
+    }
+
+    /**
+     *  @notice deposit fees collected into treasury
+     */
+    function collectFees() external {
+        require( feesCollected > 0, "No fees" ); // ensure fees to collect
+
+        shareToken.mint( address(this), feesCollected ); // mint pool token
+
+        // approve and deposit pool token to treasury
+        shareToken.approve( address(treasury), feesCollected );
+        treasury.deposit( 
+            address( shareToken ), 
+            feesCollected, 
+            treasury.valueOf( address( shareToken ), feesCollected )
+        );
+
+        feesCollected = 0; // reset collection counter
     }
 
 
@@ -435,87 +369,122 @@ contract BondTeller {
     /* ========== VIEW FUNCTIONS ========== */
 
     /**
-     *  @notice returns indexes of live bonds
-     *  @param _bonder address
-     *  @return indexes_ uint
+     *  @notice ensure pool remains in range after swap
+     *  @param _firstToken address
+     *  @param _amount uint
+     *  @param _secondToken address
+     *  @return bool
      */
-    function indexesFor( address _bonder ) public view returns ( uint[] indexes_ ) {
-        Bond[] memory info = bonderInfo[ _bonder ];
-        for( uint i = 0; i < info.length; i++ ) {
-            if( !info[ i ].redeemed ) {
-                indexes_.push( i );
-            }
-        }
-    }
-
-    // PAYOUT
-    
-    /**
-     *  @notice calculate amount of OHM available for claim by depositor
-     *  @param _depositor address
-     *  @return pendingPayout_ uint
-     */
-    function pendingFor( address _bonder, uint[] calldata _indexes ) external view returns ( uint pendingPayout_ ) {
-        for( uint i = 0; i < _indexes.length; i++ ) {
-            uint index = _indexes[ i ];
-            uint payout = bonderInfo[ _bonder ][ index ].payout;
-
-            if ( percentVestedFor( _bonder, index ) >= 10000 ) {
-                pendingPayout_ = pendingPayout_.add( payout );
-            }
-        }
+    function canExecute( address _firstToken, uint _amount, address _secondToken ) public view returns ( bool ) {
+        require( tokenInfo[ _firstToken ].accepting, "Not accepting token" ); 
         
-        pendingPayout_ = IStaking( staking ).fromAgnosticAmount( pendingPayout_ );
+        require( check( true, _firstToken, _amount ), "First token exits bounds" );
+
+        require( check( false, _secondToken, _amount ), "Second token exits bounds" );
+        
+        return true;
     }
 
     /**
-     *  @notice pending on all bonds
-     *  @param _bonder address
-     *  @return uint
+     *  @notice ensure pool remains in range after add
+     *  @param _token address
+     *  @param _amount uint
+     *  @return bool
      */
-    function totalPendingFor( address _bonder ) external view returns ( uint ) {
-        return pendingPayoutFor( _bonder, indexesFor( _bonder ) );
+    function canAdd( address _token, uint _amount ) public view returns ( bool ) {
+        require( tokenInfo[ _token ].accepting, "Not accepting token" );
+
+        require( check( true, _token, _amount ), "Added token exits bounds" );
+        
+        return true;
     }
 
     /**
-     *  @notice pending payout for each outstanding bond
-     *  @param _bonder address
-     *  @return pending_ uint[]
+     *  @notice ensure pool remains in range after remove
+     *  @param _token address
+     *  @param _amount uint
+     *  @return bool
      */
-    function allPendingFor( address _bonder ) external view returns ( uint[] pending_ ) {
-        uint[] memory indexes = indexesFor( _bonder );
+    function canRemove( address _token, uint _amount ) public view returns ( bool ) {
+        require( check( false, _token, _amount ), "Removed token exits bounds" );
+        
+        return true;
+    }
 
-        for( uint i = 0; i < indexes.length; i++ ) {
-            pending_.push( pendingFor( _bonder, indexes[i] ) );
+    /**
+     *  @notice check if remains in range
+     *  @param _add bool
+     *  @param _token address
+     *  @param _amount uint
+     *  @return bool
+     */
+    function check( bool _add, address _token, uint _amount ) public view returns ( bool ) {
+
+        if( _add ) { // use upper bound
+
+            uint maximum = totalStables.mul( tokenInfo[ _token ].highAP ).div( totalHighAP ); // maximum balance of token
+            uint balance = IERC20( _token ).balanceOf( address(this) ); // current balance of token
+
+            return ( balance.add( _amount ) <= maximum ); // check if remains in bounds
+        } else { // use lower bound
+
+            uint minimum = totalStables.mul( tokenInfo[ _token ].lowAP ).div( totalLowAP ); // minimum balance of token
+            uint balance = IERC20( _token ).balanceOf( address(this) ); // current balance of token
+
+            return ( balance.sub( _amount ) >= minimum ); // check if remains in bounds
         }
     }
 
-    // VESTING
+
+
+     /* ========== POLICY FUNCTIONS ========== */
 
     /**
-     *  @notice calculate how far into vesting a depositor is
-     *  @param _depositor address
-     *  @return percentVested_ uint
+     *  @notice change bounds of tokens in pool
+     *  @param _token address
+     *  @param _newHigh uint
+     *  @param _newLow uint
      */
-    function percentVestedFor( address _bonder, uint _index ) public view returns ( uint percentVested_ ) {
-        Bond memory bond = bonderInfo[ _bonder ][ _index ];
+     function changeBound( address _token, uint _newHigh, uint _newLow ) external {
+        totalHighAP = totalHighAP.add( _newHigh ).sub( tokenInfo[ _token ].highAP );
+        tokenInfo[ _token ].highAP = _newHigh;
 
-        uint blocksRemaining = bond.vested.sub( bond.lastInteraction );
-        uint blocksSince = block.number.sub( bond.lastInteraction );
-
-        percentVested_ = blocksSince.mul( 10000 ).div( blocksRemaining );
-    }
+        totalLowAP = totalLowAP.add( _newLow ).sub( tokenInfo[ _token ].lowAP );
+        tokenInfo[ _token ].lowAP = _newLow;
+     }
 
     /**
-     *  @notice vested percent for each outstanding bond
-     *  @param _bonder address
-     *  @return percents_ uint[]
+     *  @notice add new token to pool
+     *  @notice must call toggleAccept to activate token
+     *  @param _token address
+     *  @param _lowAP uint
+     *  @param _highAP uint
      */
-    function allPercentVestedFor( address _bonder ) external view returns ( uint[] percents_ ) {
-        uint[] memory indexes = indexesFor( _bonder );
+     function addToken( address _token, uint _lowAP, uint _highAP ) external {
 
-        for( uint i = 0; i < indexes.length; i++ ) {
-            percents_.push( percentVestedFor( _bonder, indexes[i] ) );
-        }
-    }
+         tokenInfo[ _token ] = PoolToken({
+             lowAP: _lowAP,
+             highAP: _highAP,
+             accepting: false
+         });
+
+         poolTokens.push( _token );
+     }
+     
+     /**
+      *  @notice set fee taken on trades
+      *  @param _newFee uint
+      */
+     function setFee( uint _newFee ) external {
+         swapFee = _newFee;
+     }
+
+    /**
+     *  @notice toggle whether to accept incoming token
+     *  @notice setting token to false will not allow swaps as incoming token or adds
+     *  @param _token address
+     */
+     function toggleAccept( address _token ) external {
+         tokenInfo[ _token ].accepting = !tokenInfo[ _token ].accepting;
+     }
 }
