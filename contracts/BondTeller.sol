@@ -301,7 +301,7 @@ contract BondTeller {
 
 
 
-    /* ========== EVENTS ========== */
+    /* ========== EVENTS =========== */
 
     event BondCreated( address indexed bonder, uint payout, uint expires );
     event BondRedeemed( address indexed bonder, uint payout, uint remaining );
